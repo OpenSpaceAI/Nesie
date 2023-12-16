@@ -5,7 +5,7 @@ This repository contains an implementation of Nesie, a Semi-Supervised 3D Object
 [[Paper](https://openaccess.thecvf.com/content/ICCV2023/papers/Wang_Not_Every_Side_Is_Equal_Localization_Uncertainty_Estimation_for_Semi-Supervised_ICCV_2023_paper.pdf)]
 
 ## News
-* **18. July 2023**: Nesie is accepted at CVPR 2023. :fire:
+* **18. July 2023**: Nesie is accepted at ICCV 2023. :fire:
 * **October 2023**: [Nesie PDF](https://openaccess.thecvf.com/content/ICCV2023/papers/Wang_Not_Every_Side_Is_Equal_Localization_Uncertainty_Estimation_for_Semi-Supervised_ICCV_2023_paper.pdf) released.
 * **December 2023**: Code for ScanNet dataset released.
 * **December 2023**: Code for SunRGB-D dataset will be released soon.
