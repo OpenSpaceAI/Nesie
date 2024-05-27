@@ -13,7 +13,7 @@ from mmdet3d.ops.rotated_iou import cal_giou_3d, cal_iou_3d
 from mmdet.core import multi_apply
 from mmdet.models import HEADS
 from .reliable_conv_bbox_module import ReliableConvBboxHead
-from .side_pooling_module import SidePooling
+from .quelity_estimation_module import QualityEstimation
 from mmdet3d.core import DepthInstance3DBoxes
 
 class Integral(nn.Module):
@@ -51,8 +51,43 @@ class Integral(nn.Module):
         x = F.linear(x, self.project.type_as(x)).reshape(-1, 6)
         return x
 
+class AngleIntegral(nn.Module):
+    """A fixed layer for calculating integral result from distribution.
+
+    This layer calculates the target location by :math: `sum{P(y_i) * y_i}`,
+    P(y_i) denotes the softmax vector that represents the discrete distribution
+    y_i denotes the discrete set, usually {0, 1, 2, ..., reg_max}
+
+    Args:
+        reg_max (int): The maximal value of the discrete set. Default: 16. You
+            may want to reset it according to your new dataset or related
+            settings.
+    """
+
+    def __init__(self, reg_max=16):
+        super(AngleIntegral, self).__init__()
+        self.reg_max = reg_max
+        self.register_buffer('project',
+                             torch.linspace(0, self.reg_max, self.reg_max + 1)/self.reg_max)
+
+    def forward(self, x):
+        """Forward feature from the regression head to get integral result of
+        bounding box location.
+
+        Args:
+            x (Tensor): Features of the regression head, shape (N, (n+1)),
+                n is self.reg_max.
+
+        Returns:
+            x (Tensor): Integral result of box locations, i.e., distance
+                offsets from the box center in four directions, shape (N, 1).
+        """
+        x = F.softmax(x.reshape(-1, self.reg_max + 1), dim=1)
+        x = F.linear(x, self.project.type_as(x)).reshape(-1, 1)
+        return x
+
 @HEADS.register_module()
-class NesieHead(BaseModule):
+class SAQEHead(BaseModule):
     r"""Bbox head of `Votenet <https://arxiv.org/abs/1904.09664>`_.
 
     Args:
@@ -92,11 +127,13 @@ class NesieHead(BaseModule):
                  iou_loss=None,
                  iou_pred_loss=None,
                  surface_loss=None,
+                 angle_loss=None,
+                 angle_pred_loss=None,
                  side_loss=None,
                  init_cfg=None,
                  grid_conv_cfg=None,
                  sizes=[3.0,3.0,2.5]):
-        super(NesieHead, self).__init__(init_cfg=init_cfg)
+        super(SAQEHead, self).__init__(init_cfg=init_cfg)
         self.num_classes = num_classes
         self.reg_max = reg_max
         self.reg_channels = reg_channels
@@ -112,6 +149,8 @@ class NesieHead(BaseModule):
         self.iou_loss = build_loss(iou_loss)
         self.iou_pred_loss = build_loss(iou_pred_loss)
         self.surface_loss = build_loss(surface_loss)
+        self.angle_loss = build_loss(angle_loss)
+        self.angle_pred_loss = build_loss(angle_pred_loss)
         self.side_loss = build_loss(side_loss)
         if semantic_loss is not None:
             self.semantic_loss = build_loss(semantic_loss)
@@ -122,16 +161,18 @@ class NesieHead(BaseModule):
 
         # Bbox classification and regression
         self.n_reg_outs = 6 * (self.reg_max + 1)
+        self.head_reg_outs = 12
         self.conv_pred = ReliableConvBboxHead(
             **pred_layer_cfg,
             num_cls_out_channels=self.num_classes + 2,
-            num_bbox_out_channels=self.n_reg_outs,
-            num_heading_out_channels=2,
+            num_bbox_out_channels=self.n_reg_outs + 3,
+            num_heading_out_channels=self.head_reg_outs,
             reg_max=self.reg_max)
         self.integral = Integral(self.reg_max)
+        self.angle_integral = AngleIntegral(self.head_reg_outs - 1)
         
         # quality estimation module
-        self.grid_conv = SidePooling(**grid_conv_cfg)
+        self.grid_conv = QualityEstimation(**grid_conv_cfg)
 
     def _extract_input(self, feat_dict):
         """Extract inputs from features dictionary.
@@ -150,9 +191,9 @@ class NesieHead(BaseModule):
     def side2box(self, aggregated_points, bbox_pred, results):
         B, proposal_num = bbox_pred.shape[:2]
         surface_pred_res = self.integral(bbox_pred[..., :self.n_reg_outs]).reshape(B, proposal_num, -1)
-        scale_x = torch.ones_like(bbox_pred[..., self.n_reg_outs + 0]) * torch.tensor(self.sizes[0])
-        scale_y = torch.ones_like(bbox_pred[..., self.n_reg_outs + 0]) * torch.tensor(self.sizes[1])
-        scale_z = torch.ones_like(bbox_pred[..., self.n_reg_outs + 0]) * torch.tensor(self.sizes[2])
+        scale_x = torch.exp(bbox_pred[..., self.n_reg_outs + 0])
+        scale_y = torch.exp(bbox_pred[..., self.n_reg_outs + 1])
+        scale_z = torch.exp(bbox_pred[..., self.n_reg_outs + 2])
         x1 = aggregated_points[..., 0] - surface_pred_res[..., 0] * scale_x     
         y1 = aggregated_points[..., 1] - surface_pred_res[..., 1] * scale_y
         z1 = aggregated_points[..., 2] - surface_pred_res[..., 2] * scale_z
@@ -161,9 +202,10 @@ class NesieHead(BaseModule):
         z2 = aggregated_points[..., 2] + surface_pred_res[..., 5] * scale_z
         results['surface_pred'] = torch.stack((x1, y1, z1, x2, y2, z2), dim=-1)
         results['surface_scale'] = torch.stack((scale_x, scale_y, scale_z, scale_x, scale_y, scale_z), dim=-1)
-        norm = torch.pow(torch.pow(bbox_pred[..., self.n_reg_outs + 0], 2) + torch.pow(bbox_pred[..., self.n_reg_outs + 1], 2), 0.5)
-        sin = bbox_pred[..., self.n_reg_outs + 0] / norm
-        cos = bbox_pred[..., self.n_reg_outs + 1] / norm
+
+        angles = self.angle_integral(bbox_pred[..., self.n_reg_outs + 3:]).reshape(B, proposal_num) * 2 * torch.pi
+        angles[angles > torch.pi] -= 2 * torch.pi
+
         results['bbox_preds'] = torch.stack((
             (x1 + x2)/2.0,
             (y1 + y2)/2.0,
@@ -171,7 +213,7 @@ class NesieHead(BaseModule):
             x2 - x1,
             y2 - y1,
             z2 - z1,
-            torch.atan2(sin, cos)
+            angles
         ), dim=-1)
         return results
 
@@ -182,8 +224,8 @@ class NesieHead(BaseModule):
         center_jitter = center.unsqueeze(2).expand(-1, -1, factor, -1).contiguous().view(B, -1, 3)
         size_jitter = size.unsqueeze(2).expand(-1, -1, factor, -1).contiguous().view(B, -1, 3)
         heading_jitter = heading.unsqueeze(2).expand(-1, -1, factor).contiguous().view(B, -1)
-        center_jitter = center_jitter + size_jitter * torch.randn(size_jitter.shape).cuda() * 0.3
-        size_jitter = size_jitter + size_jitter * torch.randn(size_jitter.shape).cuda() * 0.3
+        center_jitter = center_jitter + size_jitter * (torch.randn(size_jitter.shape).cuda() * 0.5)
+        size_jitter = size_jitter + size_jitter * (torch.randn(size_jitter.shape).cuda() * 0.5 + 0.2)
         size_jitter = torch.clamp(size_jitter, min=1e-8)
 
         center = torch.cat([center, center_jitter], dim=1)
@@ -206,6 +248,8 @@ class NesieHead(BaseModule):
             jitter_size[..., 1], 
             jitter_size[..., 2], 
             jitter_heading), dim=-1)
+
+        results['jitter_surface_preds'] = Bbox2Surface(results['jitter_bbox_preds'])
         return center, size, heading_, results
 
     def forward(self, feat_dict, sample_mod, dataset_name = 'ScanNet'):
@@ -263,6 +307,15 @@ class NesieHead(BaseModule):
         center, size, heading, results = self.jitter_bbox_preds(results, dataset_name)
         results = self.grid_conv(center.detach(), size.detach(), heading.detach(), results)
 
+        # rotation prediction
+        results['rotate_scores'] = results['rotate_scores'].sigmoid()
+        results['rotate_scores_jitter'] = results['rotate_scores'][:, origin_proposal_num:]
+        results['rotate_scores'] = results['rotate_scores'][:, :origin_proposal_num]
+
+        # obj prediction
+        results['R_obj_scores_jitter'] = results['R_obj_scores'][:, origin_proposal_num:]
+        results['R_obj_scores'] = results['R_obj_scores'][:, :origin_proposal_num]
+
         # iou prediction
         results['iou_scores'] = results['iou_scores'].sigmoid()
         results['iou_scores_jitter'] = results['iou_scores'][:, origin_proposal_num:]
@@ -316,10 +369,215 @@ class NesieHead(BaseModule):
                                               vote_target_masks, vote_targets)
 
         # calculate objectness loss
-        objectness_loss = self.objectness_loss(
+        objectness_loss_1 = self.objectness_loss(
             bbox_preds['obj_scores'].transpose(2, 1),
             objectness_targets,
             weight=objectness_weights)
+        
+        objectness_loss_2 = self.objectness_loss(
+            bbox_preds['R_obj_scores'].transpose(2, 1),
+            objectness_targets,
+            weight=objectness_weights)
+
+        objectness_loss_3 = self.objectness_loss(
+            bbox_preds['R_obj_scores_jitter'].transpose(2, 1),
+            objectness_targets,
+            weight=objectness_weights)
+
+        objectness_loss = objectness_loss_1 + (objectness_loss_2 + objectness_loss_3) * 0.5
+
+        # calculate center loss
+        source2target_loss, target2source_loss = self.center_loss(
+            bbox_preds['bbox_preds'][..., :3],
+            center_targets,
+            src_weight=box_loss_weights,
+            dst_weight=valid_gt_weights)
+        center_loss = source2target_loss + target2source_loss
+
+        # calculate surface loss
+        surface_weight = box_loss_weights.reshape(-1).unsqueeze(-1).repeat(1,6)
+        surface_loss = self.surface_loss(
+            bbox_preds['surface_pred'].reshape(-1, 6),
+            torch.cat(bbox_targets, dim=0),
+            bbox_preds['surface_scale'].reshape(-1, 6),
+            bbox_preds['aggregated_points'].reshape(-1, 3),
+            bbox_preds['bbox_probs'].permute(0,3,1,2).reshape(-1, 6, self.reg_max+1),
+            weight=surface_weight,
+            reduction_override='none',
+        )
+        # N_class = bbox_preds['side_scores'].shape[-1]
+        # side_pred = bbox_preds['side_scores'].reshape(-1, 6, N_class)
+        # side_scores = torch.stack([side_pred[i,:,indx[i]] for i in range(indx.shape[0])]).reshape(-1, 6)
+        # sigma = 0.8 * side_scores * side_scores - 1.8 * side_scores + torch.ones_like(side_scores)
+        # surface_loss = torch.exp(-sigma) * surface_loss + self.alpha * sigma * surface_weight
+        surface_loss = surface_loss.sum()
+
+        # calculate angle loss
+        pred_angle = bbox_preds['bbox_preds'][..., -1].reshape(-1)
+        target_angle = torch.cat(bbox_targets, dim=0)[..., -1]
+        pred_angle_sin = torch.sin(pred_angle)
+        pred_angle_cos = torch.cos(pred_angle)
+        target_angle_sin = torch.sin(target_angle)
+        target_angle_cos = torch.cos(target_angle)
+        angle_sin_loss = self.angle_loss(pred_angle_sin, target_angle_sin, weight=box_loss_weights.reshape(-1), reduction_override='none')
+        angle_cos_loss = self.angle_loss(pred_angle_cos, target_angle_cos, weight=box_loss_weights.reshape(-1), reduction_override='none')
+        angle_loss = angle_sin_loss + angle_cos_loss
+        angle_loss = angle_loss.sum()
+
+        angle_score_labels = (angle_sin_loss + angle_cos_loss).detach() / ( box_loss_weights.max())
+        pred_angle = bbox_preds['bbox_preds'][..., -1].reshape(-1)
+        N_class = bbox_preds['rotate_scores'].shape[-1]
+        indx = bbox_preds['sem_scores'].max(dim=-1)[1].reshape(-1)
+        angle_pred_scores = bbox_preds['rotate_scores'].reshape(-1, N_class)
+        angle_scores = torch.stack([angle_pred_scores[i,indx[i]] for i in range(indx.shape[0])]).reshape(-1)
+        angle_pred_loss = self.angle_pred_loss(angle_scores, angle_score_labels, weight=box_loss_weights.reshape(-1))
+
+        jitter_angle_pred_scores = bbox_preds['rotate_scores_jitter'].reshape(-1, N_class)
+        jitter_angle_scores = torch.stack([jitter_angle_pred_scores[i,indx[i]] for i in range(indx.shape[0])]).reshape(-1)
+
+        angle_pred_loss += self.angle_pred_loss(jitter_angle_scores, angle_score_labels, weight=box_loss_weights.reshape(-1))
+
+        # angle_sigma = 0.8 * angle_scores * angle_scores - 1.8 * angle_scores + torch.ones_like(angle_scores)
+        # angle_loss = torch.exp(-angle_sigma) * angle_loss + self.alpha * angle_sigma * box_loss_weights.reshape(-1)
+
+        # calculate semantic loss
+        semantic_loss = self.semantic_loss(
+            bbox_preds['sem_scores'].transpose(2, 1),
+            mask_targets,
+            weight=box_loss_weights)
+
+        # calculate iou loss
+        iou_weight = box_loss_weights.reshape(-1)
+        iou_loss = self.iou_loss(
+            bbox_preds['bbox_preds'].reshape(-1, 7),
+            torch.cat(bbox_targets, dim=0),
+            weight=iou_weight,
+            reduction_override='none',
+        ).reshape(-1)
+        # sigma_mean = sigma.mean(dim=-1)
+        # iou_loss = torch.exp(-sigma_mean) * iou_loss + self.alpha * sigma_mean * iou_weight
+        iou_loss = iou_loss.sum()
+
+        # calculate iou pred loss
+        targets = torch.cat(bbox_targets, dim=0)
+        targets = targets.view_as(bbox_preds['bbox_preds'])
+        label_iou = cal_iou_3d(bbox_preds['bbox_preds'], targets).detach().view(-1)
+        label_iou_jitter = cal_iou_3d(bbox_preds['jitter_bbox_preds'], targets).detach().view(-1)
+        label_cls = mask_targets.reshape(-1)
+        label_cls_jitter = mask_targets.reshape(-1)
+
+        loss_iou = self.iou_pred_loss(
+            bbox_preds['iou_scores'].reshape(-1, self.num_classes), (label_cls, label_iou),
+            weight=box_loss_weights.reshape(-1))
+        loss_iou_jitter = self.iou_pred_loss(
+            bbox_preds['iou_scores_jitter'].reshape(-1, self.num_classes), (label_cls_jitter, label_iou_jitter),
+            weight=box_loss_weights.reshape(-1))
+        iou_pred_loss = loss_iou + loss_iou_jitter
+
+        # calculate side pred loss
+        side_pred = bbox_preds['side_scores'].reshape(-1, 6, self.num_classes)
+        side_pred = torch.stack([side_pred[i,:,label_cls[i]] for i in range(label_cls.shape[0])])
+        bbox_side_gt = torch.cat(bbox_targets, dim=0)
+        side_loss = self.side_loss(
+            side_pred,
+            bbox_preds['surface_pred'].reshape(-1, 6).detach(),
+            bbox_side_gt,
+            bbox_preds['surface_scale'].reshape(-1, 6),
+            bbox_preds['aggregated_points'].reshape(-1, 3),
+            bbox_preds['bbox_probs'].permute(0,3,1,2).reshape(-1, 6, self.reg_max+1),
+            weight=surface_weight,
+        )
+
+        side_pred_jitter = bbox_preds['side_scores_jitter'].reshape(-1, 6, self.num_classes)
+        side_pred_jitter = torch.stack([side_pred_jitter[i,:,label_cls_jitter[i]] for i in range(label_cls_jitter.shape[0])])
+        bbox_side_gt = torch.cat(bbox_targets, dim=0)
+        side_jitter_loss = self.side_loss(
+            side_pred_jitter,
+            bbox_preds['jitter_surface_preds'].reshape(-1, 6).detach(),
+            bbox_side_gt,
+            bbox_preds['surface_scale'].reshape(-1, 6),
+            bbox_preds['aggregated_points'].reshape(-1, 3),
+            bbox_preds['bbox_probs'].permute(0,3,1,2).reshape(-1, 6, self.reg_max+1),
+            weight=surface_weight,
+        )
+        side_loss = side_loss + side_jitter_loss
+        
+        # total loss
+        losses = dict(
+            vote_loss=vote_loss,
+            objectness_loss=objectness_loss,
+            semantic_loss=semantic_loss,
+            center_loss=center_loss,
+            surface_loss=surface_loss,
+            angle_loss=angle_loss,
+            angle_pred_loss=angle_pred_loss,
+            iou_loss=iou_loss,
+            iou_pred_loss=iou_pred_loss,
+            side_loss=side_loss)
+
+        if ret_target:
+            losses['targets'] = targets
+
+        return losses
+
+    @force_fp32(apply_to=('bbox_preds', ))
+    def sup_loss(self,
+             bbox_preds,
+             points,
+             gt_bboxes_3d,
+             gt_labels_3d,
+             pts_semantic_mask=None,
+             pts_instance_mask=None,
+             img_metas=None,
+             gt_bboxes_ignore=None,
+             ret_target=False):
+        """Compute loss.
+
+        Args:
+            bbox_preds (dict): Predictions from forward of vote head.
+            points (list[torch.Tensor]): Input points.
+            gt_bboxes_3d (list[:obj:`BaseInstance3DBoxes`]): Ground truth \
+                bboxes of each sample.
+            gt_labels_3d (list[torch.Tensor]): Labels of each sample.
+            pts_semantic_mask (None | list[torch.Tensor]): Point-wise
+                semantic mask.
+            pts_instance_mask (None | list[torch.Tensor]): Point-wise
+                instance mask.
+            ret_target (Bool): Return targets or not.
+
+        Returns:
+            dict: Losses of Votenet.
+        """
+        targets = self.get_targets(points, gt_bboxes_3d, gt_labels_3d,
+                                   pts_semantic_mask, pts_instance_mask,
+                                   bbox_preds)
+        (vote_targets, vote_target_masks, center_targets, bbox_targets, mask_targets, valid_gt_masks,
+         objectness_targets, objectness_weights, box_loss_weights,
+         valid_gt_weights, assignment) = targets
+
+        # calculate vote loss
+        vote_loss = self.vote_module.get_loss(bbox_preds['seed_points'],
+                                              bbox_preds['vote_points'],
+                                              bbox_preds['seed_indices'],
+                                              vote_target_masks, vote_targets)
+
+        # calculate objectness loss
+        objectness_loss_1 = self.objectness_loss(
+            bbox_preds['obj_scores'].transpose(2, 1),
+            objectness_targets,
+            weight=objectness_weights)
+        
+        objectness_loss_2 = self.objectness_loss(
+            bbox_preds['R_obj_scores'].transpose(2, 1),
+            objectness_targets,
+            weight=objectness_weights)
+
+        objectness_loss_3 = self.objectness_loss(
+            bbox_preds['R_obj_scores_jitter'].transpose(2, 1),
+            objectness_targets,
+            weight=objectness_weights)
+
+        objectness_loss = objectness_loss_1 + (objectness_loss_2 + objectness_loss_3) * 0.5
 
         # calculate center loss
         source2target_loss, target2source_loss = self.center_loss(
@@ -345,8 +603,25 @@ class NesieHead(BaseModule):
         side_pred = bbox_preds['side_scores'].reshape(-1, 6, N_class)
         side_scores = torch.stack([side_pred[i,:,indx[i]] for i in range(indx.shape[0])]).reshape(-1, 6)
         sigma = 0.8 * side_scores * side_scores - 1.8 * side_scores + torch.ones_like(side_scores)
-        surface_loss = torch.exp(-sigma) * surface_loss + self.alpha * sigma * surface_weight
+        surface_loss = torch.exp(-sigma.detach()) * surface_loss
         surface_loss = surface_loss.sum()
+
+        # calculate angle loss
+        pred_angle = bbox_preds['bbox_preds'][..., -1].reshape(-1)
+        target_angle = torch.cat(bbox_targets, dim=0)[..., -1]
+        pred_angle_sin = torch.sin(pred_angle)
+        pred_angle_cos = torch.cos(pred_angle)
+        target_angle_sin = torch.sin(target_angle)
+        target_angle_cos = torch.cos(target_angle)
+        angle_sin_loss = self.angle_loss(pred_angle_sin, target_angle_sin, weight=box_loss_weights.reshape(-1), reduction_override='none')
+        angle_cos_loss = self.angle_loss(pred_angle_cos, target_angle_cos, weight=box_loss_weights.reshape(-1), reduction_override='none')
+        angle_loss = angle_sin_loss + angle_cos_loss
+        N_class = bbox_preds['rotate_scores'].shape[-1]
+        angle_pred_scores = bbox_preds['rotate_scores'].reshape(-1, N_class)
+        angle_scores = torch.stack([angle_pred_scores[i,indx[i]] for i in range(indx.shape[0])]).reshape(-1)
+        angle_sigma = 0.8 * angle_scores * angle_scores - 1.8 * angle_scores + torch.ones_like(angle_scores)
+        angle_loss = torch.exp(-angle_sigma.detach()) * angle_loss
+        angle_loss = angle_loss.sum()
 
         # calculate semantic loss
         semantic_loss = self.semantic_loss(
@@ -363,7 +638,7 @@ class NesieHead(BaseModule):
             reduction_override='none',
         ).reshape(-1)
         sigma_mean = sigma.mean(dim=-1)
-        iou_loss = torch.exp(-sigma_mean) * iou_loss + self.alpha * sigma_mean * iou_weight
+        iou_loss = torch.exp(-sigma_mean.detach()) * iou_loss
         iou_loss = iou_loss.sum()
 
         # calculate iou pred loss
@@ -372,12 +647,13 @@ class NesieHead(BaseModule):
         label_iou = cal_iou_3d(bbox_preds['bbox_preds'], targets).detach().view(-1)
         label_iou_jitter = cal_iou_3d(bbox_preds['jitter_bbox_preds'], targets).detach().view(-1)
         label_cls = mask_targets.reshape(-1)
+        label_cls_jitter = mask_targets.reshape(-1)
 
         loss_iou = self.iou_pred_loss(
             bbox_preds['iou_scores'].reshape(-1, self.num_classes), (label_cls, label_iou),
             weight=box_loss_weights.reshape(-1))
         loss_iou_jitter = self.iou_pred_loss(
-            bbox_preds['iou_scores_jitter'].reshape(-1, self.num_classes), (label_cls, label_iou_jitter),
+            bbox_preds['iou_scores_jitter'].reshape(-1, self.num_classes), (label_cls_jitter, label_iou_jitter),
             weight=box_loss_weights.reshape(-1))
         iou_pred_loss = loss_iou + loss_iou_jitter
 
@@ -394,6 +670,20 @@ class NesieHead(BaseModule):
             bbox_preds['bbox_probs'].permute(0,3,1,2).reshape(-1, 6, self.reg_max+1),
             weight=surface_weight,
         )
+
+        side_pred_jitter = bbox_preds['side_scores_jitter'].reshape(-1, 6, self.num_classes)
+        side_pred_jitter = torch.stack([side_pred_jitter[i,:,label_cls_jitter[i]] for i in range(label_cls_jitter.shape[0])])
+        bbox_side_gt = torch.cat(bbox_targets, dim=0)
+        side_jitter_loss = self.side_loss(
+            side_pred_jitter,
+            bbox_preds['jitter_surface_preds'].reshape(-1, 6).detach(),
+            bbox_side_gt,
+            bbox_preds['surface_scale'].reshape(-1, 6),
+            bbox_preds['aggregated_points'].reshape(-1, 3),
+            bbox_preds['bbox_probs'].permute(0,3,1,2).reshape(-1, 6, self.reg_max+1),
+            weight=surface_weight,
+        )
+        side_loss = side_loss + side_jitter_loss
         
         # total loss
         losses = dict(
@@ -402,6 +692,7 @@ class NesieHead(BaseModule):
             semantic_loss=semantic_loss,
             center_loss=center_loss,
             surface_loss=surface_loss,
+            angle_loss=angle_loss,
             iou_loss=iou_loss,
             iou_pred_loss=iou_pred_loss,
             side_loss=side_loss)
@@ -481,7 +772,7 @@ class NesieHead(BaseModule):
         side_scores = torch.stack([side_pred[i,:,indx[i]] for i in range(indx.shape[0])]).reshape(-1, 6)
         sigma = 0.8 * side_scores * side_scores - 1.8 * side_scores + torch.ones_like(side_scores)
         sigma_mean = sigma.mean(dim=-1)
-        unsup_iou_loss = torch.exp(-sigma_mean) * unsup_iou_loss + self.alpha * sigma_mean * iou_weight
+        unsup_iou_loss = torch.exp(-sigma_mean.detach()) * unsup_iou_loss
         unsup_iou_loss = unsup_iou_loss.sum()
 
         # calculate surface loss
@@ -495,7 +786,7 @@ class NesieHead(BaseModule):
             weight=surface_weight,
             reduction_override='none',
         )
-        unsup_surface_loss = torch.exp(-sigma) * unsup_surface_loss + self.alpha * sigma * surface_weight
+        unsup_surface_loss = torch.exp(-sigma.detach()) * unsup_surface_loss
         unsup_surface_loss = unsup_surface_loss.sum()     
 
         un_label_weight = 2.0
@@ -699,7 +990,7 @@ class NesieHead(BaseModule):
             list[tuple[torch.Tensor]]: Bounding boxes, scores and labels.
         """
         # decode boxes
-        obj_scores = F.softmax(bbox_preds['obj_scores'], dim=-1)[..., -1]
+        obj_scores = F.softmax(bbox_preds['R_obj_scores'], dim=-1)[..., -1]
         sem_scores = F.softmax(bbox_preds['sem_scores'], dim=-1)
         bbox3d = bbox_preds['bbox_preds']  # self.bbox_coder.decode(bbox_preds)
         if use_iou_for_nms:
@@ -798,3 +1089,15 @@ class NesieHead(BaseModule):
         iou_scores = results['iou_scores'].reshape(-1, self.num_classes)
         results['iou_scores'] = torch.stack([iou_scores[i,indx[i]] for i in range(iou_scores.shape[0])]).reshape(B, -1)
         return results
+
+def Bbox2Surface(bbox2):
+    center = bbox2[...,:3]
+    size = bbox2[...,3:6]
+    surface = torch.zeros_like(bbox2[...,:6])
+    surface[..., 0] = center[..., 0] - 0.5 * size[..., 0]
+    surface[..., 1] = center[..., 1] - 0.5 * size[..., 1]
+    surface[..., 2] = center[..., 2] - 0.5 * size[..., 2]
+    surface[..., 3] = center[..., 0] + 0.5 * size[..., 0]
+    surface[..., 4] = center[..., 1] + 0.5 * size[..., 1]
+    surface[..., 5] = center[..., 2] + 0.5 * size[..., 2]
+    return surface
