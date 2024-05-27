@@ -111,9 +111,9 @@ class SidePooling(nn.Module):
         )
         grid_step_z = grid_step_z.view(1, 1, -1).expand(B, K, -1)
 
-        x_grid = grid_step_x * size[:, :, 0:1]
-        y_grid = grid_step_y * size[:, :, 1:2]
-        z_grid = grid_step_z * size[:, :, 2:3]
+        x_grid = grid_step_x * size[:, :, 0:1] / 2
+        y_grid = grid_step_y * size[:, :, 1:2] / 2
+        z_grid = grid_step_z * size[:, :, 2:3] / 2
 
         whole_grid = torch.cat(
             [x_grid.unsqueeze(-1), y_grid.unsqueeze(-1), z_grid.unsqueeze(-1)], dim=-1
